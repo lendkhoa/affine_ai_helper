@@ -3,6 +3,14 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "8mb" }));
 
+app.use((req, res, next) => {
+  console.log('\n=== INCOMING REQUEST ===');
+  console.log(`Time: ${new Date().toISOString()}`);
+  console.log(`Method: ${req.method}`);
+  console.log(`URL: ${req.url}`);
+  next();
+});
+
 // ---------- helpers ----------
 function sseHeaders(res) {
   res.set({
@@ -79,7 +87,7 @@ async function passthru(req, res, path) {
   const r = await fetch(`${process.env.LITELLM_URL}${path}`, {
     method: req.method,
     headers: {
-      "Authorization": `Bearer ${process.env.LITELLM_KEY}`,
+      "Authorization": `Bearer ${process.env.LITELLM_KEY || ""}`,
       "Content-Type": req.get("content-type") || "application/json",
     },
     body: ["GET","HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body),
@@ -96,8 +104,53 @@ async function passthru(req, res, path) {
   res.end();
 }
 
+// ---------- /v1/models - Custom implementation for Ollama ----------
+app.get("/v1/models", async (req, res) => {
+  console.log('=== MODELS LIST REQUEST ===');
+  try {
+    // Call Ollama's /api/tags endpoint
+    const ollamaResponse = await fetch(`${process.env.LITELLM_URL}/api/tags`);
+    
+    if (!ollamaResponse.ok) {
+      console.error(`Ollama error: ${ollamaResponse.status}`);
+      return res.status(ollamaResponse.status).json({ 
+        error: `Failed to fetch models from Ollama: ${ollamaResponse.statusText}` 
+      });
+    }
+    
+    const ollamaData = await ollamaResponse.json();
+    console.log('Ollama models:', ollamaData.models?.map(m => m.name));
+    
+    // Transform Ollama format to OpenAI format
+    const models = (ollamaData.models || []).map(model => ({
+      id: model.name,
+      object: 'model',
+      created: Math.floor(Date.now() / 1000),
+      owned_by: 'ollama',
+    }));
+    
+    const response = {
+      object: 'list',
+      data: models
+    };
+    
+    console.log('Returning models:', models.map(m => m.id));
+    res.json(response);
+  } catch (error) {
+    console.error('Error fetching models:', error.message);
+    res.status(500).json({ 
+      error: error.message,
+      details: 'Failed to connect to Ollama. Make sure Ollama is running.'
+    });
+  }
+});
+
 // ---------- /v1/responses adapter ----------
 app.post("/v1/responses", async (req, res) => {
+  console.log('=== RESPONSES REQUEST ===');
+  console.log('Model:', req.body?.model);
+  console.log('Stream:', req.body?.stream);
+  
   try {
     const { model, stream = true } = req.body || {};
     // Normalize to OpenAI chat messages (strings only)
@@ -109,7 +162,7 @@ app.post("/v1/responses", async (req, res) => {
     } = req.body || {};
 
     // Stable IDs for Responses clients
-    const uuid = (globalThis.crypto?.randomUUID?.() || require("crypto").randomUUID()).replace(/-/g,"");
+    const uuid = (globalThis.crypto?.randomUUID?.() || (await import("crypto")).randomUUID()).replace(/-/g,"");
     const msgId  = `msg_${uuid}`;
     const respId = `resp_${Buffer.from(`shim:${Date.now()}:${msgId}`).toString("base64")}`;
     const now    = Math.floor(Date.now()/1000);
@@ -119,7 +172,7 @@ app.post("/v1/responses", async (req, res) => {
       const r = await fetch(`${process.env.LITELLM_URL}/v1/chat/completions`, {
         method: "POST",
         headers: {
-          "Authorization": `Bearer ${process.env.LITELLM_KEY}`,
+          "Authorization": `Bearer ${process.env.LITELLM_KEY || ""}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -166,7 +219,7 @@ app.post("/v1/responses", async (req, res) => {
     const upstream = await fetch(`${process.env.LITELLM_URL}/v1/chat/completions`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.LITELLM_KEY}`,
+        "Authorization": `Bearer ${process.env.LITELLM_KEY || ""}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -177,6 +230,7 @@ app.post("/v1/responses", async (req, res) => {
 
     if (!upstream.ok || !upstream.body) {
       const text = await upstream.text().catch(() => "");
+      console.error('Upstream error:', upstream.status, text.slice(0, 300));
       // Signal error in Responses shape so client surfaces it
       sendSSE(res, {
         type: "response.error",
@@ -241,6 +295,7 @@ app.post("/v1/responses", async (req, res) => {
     }
     res.end();
   } catch (err) {
+    console.error('Response error:', err);
     // defensive error reporting to client in Responses shape
     sseHeaders(res);
     sendSSE(res, { type: "response.error", error: { message: (err?.message || "adapter error") } });
@@ -249,12 +304,29 @@ app.post("/v1/responses", async (req, res) => {
   }
 });
 
+// ---------- /v1/chat/completions - For direct OpenAI compatibility ----------
+app.post('/v1/chat/completions', async (req, res) => {
+  console.log('\n=== CHAT COMPLETION REQUEST ===');
+  console.log('Model:', req.body?.model);
+  console.log('Stream:', req.body?.stream);
+  console.log('Messages count:', req.body?.messages?.length);
+  
+  // Just pass through to Ollama
+  await passthru(req, res, '/v1/chat/completions');
+});
+
 // ---------- pass-throughs ----------
-app.get("/v1/models", (req, res) => passthru(req, res, "/v1/models"));
 app.post("/v1/embeddings", (req, res) => passthru(req, res, "/v1/embeddings"));
-app.all("*", (req, res) => passthru(req, res, req.originalUrl));
+app.all("*", (req, res) => {
+  console.log('Unknown endpoint, attempting passthrough:', req.originalUrl);
+  passthru(req, res, req.originalUrl);
+});
 
 // ---------- start ----------
-app.listen(process.env.PORT || 4011, () => {
-  console.log(`responses-adapter listening on ${process.env.PORT || 4011}`);
+const PORT = process.env.PORT || 4011;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n🚀 responses-adapter listening on ${PORT}`);
+  console.log(`📍 Local: http://localhost:${PORT}`);
+  console.log(`🐳 Docker: http://host.docker.internal:${PORT}`);
+  console.log(`🤖 Ollama: ${process.env.LITELLM_URL || 'http://localhost:11434'}\n`);
 });
