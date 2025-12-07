@@ -11,6 +11,30 @@ app.use((req, res, next) => {
   next();
 });
 
+// ---------- Model Mapping Configuration ----------
+// Maps AFFiNE's expected model names to your actual Ollama models
+const MODEL_ALIASES = {
+  'gemini-2.5-flash': 'gemma3:4b',
+  'gemini-2.5-pro': 'gemma3:4b',
+  'claude-sonnet-4-5@20250929': 'gemma3:4b',
+  'gpt-4o-2024-08-06': 'gemma3:4b',
+  'gpt-5-mini': 'gemma3:4b',
+  'gemini-embedding-001': 'gemma3:4b',
+  'gpt-image-1': 'gemma3:4b',
+  'gpt-4.1': 'gemma3:4b',
+  // Add the actual model as well
+  'gemma3:4b': 'gemma3:4b'
+};
+
+// Function to resolve model name
+function resolveModel(requestedModel) {
+  const resolved = MODEL_ALIASES[requestedModel] || requestedModel;
+  if (resolved !== requestedModel) {
+    console.log(`📝 Model mapping: ${requestedModel} → ${resolved}`);
+  }
+  return resolved;
+}
+
 // ---------- helpers ----------
 function sseHeaders(res) {
   res.set({
@@ -84,13 +108,19 @@ function normalizeMessagesFromBody(body) {
 }
 
 async function passthru(req, res, path) {
+  // Resolve model name if present in request body
+  let body = req.body;
+  if (body && body.model) {
+    body = { ...body, model: resolveModel(body.model) };
+  }
+  
   const r = await fetch(`${process.env.LITELLM_URL}${path}`, {
     method: req.method,
     headers: {
       "Authorization": `Bearer ${process.env.LITELLM_KEY || ""}`,
       "Content-Type": req.get("content-type") || "application/json",
     },
-    body: ["GET","HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body),
+    body: ["GET","HEAD"].includes(req.method) ? undefined : JSON.stringify(body),
   });
   res.status(r.status);
   r.headers.forEach((v, k) => { if (!["content-length","transfer-encoding"].includes(k)) res.setHeader(k, v); });
@@ -104,7 +134,7 @@ async function passthru(req, res, path) {
   res.end();
 }
 
-// ---------- /v1/models - Custom implementation for Ollama ----------
+// ---------- /v1/models - Return both real and aliased models ----------
 app.get("/v1/models", async (req, res) => {
   console.log('=== MODELS LIST REQUEST ===');
   try {
@@ -119,11 +149,20 @@ app.get("/v1/models", async (req, res) => {
     }
     
     const ollamaData = await ollamaResponse.json();
-    console.log('Ollama models:', ollamaData.models?.map(m => m.name));
+    const ollamaModels = ollamaData.models?.map(m => m.name) || [];
+    console.log('Ollama models:', ollamaModels);
     
-    // Transform Ollama format to OpenAI format
-    const models = (ollamaData.models || []).map(model => ({
-      id: model.name,
+    // Create models list with both real and aliased names
+    const modelSet = new Set();
+    
+    // Add real Ollama models
+    ollamaModels.forEach(name => modelSet.add(name));
+    
+    // Add all aliased model names
+    Object.keys(MODEL_ALIASES).forEach(alias => modelSet.add(alias));
+    
+    const models = Array.from(modelSet).map(modelId => ({
+      id: modelId,
       object: 'model',
       created: Math.floor(Date.now() / 1000),
       owned_by: 'ollama',
@@ -148,11 +187,15 @@ app.get("/v1/models", async (req, res) => {
 // ---------- /v1/responses adapter ----------
 app.post("/v1/responses", async (req, res) => {
   console.log('=== RESPONSES REQUEST ===');
-  console.log('Model:', req.body?.model);
+  console.log('Requested Model:', req.body?.model);
   console.log('Stream:', req.body?.stream);
   
   try {
-    const { model, stream = true } = req.body || {};
+    const { model: requestedModel, stream = true } = req.body || {};
+    
+    // Resolve the model name to actual Ollama model
+    const model = resolveModel(requestedModel);
+    
     // Normalize to OpenAI chat messages (strings only)
     const messages = normalizeMessagesFromBody(req.body);
 
@@ -185,7 +228,7 @@ app.post("/v1/responses", async (req, res) => {
       return res.json({
         id: respId,
         object: "response",
-        model,
+        model: requestedModel, // Return the requested model name, not the resolved one
         status: "completed",
         created_at: now,
         output: [{
@@ -202,7 +245,7 @@ app.post("/v1/responses", async (req, res) => {
     sseHeaders(res);
 
     // prelude required by Vercel AI/Responses consumers (AFFiNE)
-    sendSSE(res, { type: "response.created", response: { id: respId, object: "response", model, created_at: now }});
+    sendSSE(res, { type: "response.created", response: { id: respId, object: "response", model: requestedModel, created_at: now }});
     sendSSE(res, {
       type: "response.output_item.added",
       output_index: 0,
@@ -272,7 +315,7 @@ app.post("/v1/responses", async (req, res) => {
           sendSSE(res, {
             type: "response.completed",
             response: {
-              id: respId, object: "response", model, status: "completed", created_at: now,
+              id: respId, object: "response", model: requestedModel, status: "completed", created_at: now,
               output: [{ type: "message", id: msgId, role: "assistant",
                 content: [{ type: "output_text", text: full, annotations: [] }] }],
               usage: {}
@@ -307,11 +350,11 @@ app.post("/v1/responses", async (req, res) => {
 // ---------- /v1/chat/completions - For direct OpenAI compatibility ----------
 app.post('/v1/chat/completions', async (req, res) => {
   console.log('\n=== CHAT COMPLETION REQUEST ===');
-  console.log('Model:', req.body?.model);
+  console.log('Requested Model:', req.body?.model);
   console.log('Stream:', req.body?.stream);
   console.log('Messages count:', req.body?.messages?.length);
   
-  // Just pass through to Ollama
+  // Pass through to Ollama with model resolution
   await passthru(req, res, '/v1/chat/completions');
 });
 
@@ -324,9 +367,17 @@ app.all("*", (req, res) => {
 
 // ---------- start ----------
 const PORT = process.env.PORT || 4011;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 responses-adapter listening on ${PORT}`);
+const HOST = process.env.HOST || '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`\n🚀 responses-adapter listening on ${HOST}:${PORT}`);
   console.log(`📍 Local: http://localhost:${PORT}`);
   console.log(`🐳 Docker: http://host.docker.internal:${PORT}`);
-  console.log(`🤖 Ollama: ${process.env.LITELLM_URL || 'http://localhost:11434'}\n`);
+  console.log(`🤖 Ollama: ${process.env.LITELLM_URL || 'http://localhost:11434'}`);
+  console.log(`\n📋 Model Aliases:`);
+  Object.entries(MODEL_ALIASES).forEach(([alias, target]) => {
+    if (alias !== target) {
+      console.log(`   ${alias} → ${target}`);
+    }
+  });
+  console.log();
 });
